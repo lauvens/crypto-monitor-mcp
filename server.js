@@ -1,41 +1,28 @@
-const http = require("http");
-const fs = require("fs");
-const path = require("path");
-const axios = require("axios");
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
+import { z } from "zod";
 
-const PORT = 3000;
 const COINGECKO_BASE = "https://api.coingecko.com/api/v3";
+const widgetHtml = readFileSync("public/widget.html", "utf8");
+const port = Number(process.env.PORT ?? 3000);
+const MCP_PATH = "/mcp";
 
-// ── CORS headers for embedded iframe usage ──
-function setCors(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-}
-
-// ── Fetch crypto market data from CoinGecko ──
-async function fetchCryptoMarkets(params = {}) {
-  const {
-    ids,
-    vs_currency = "usd",
-    order = "market_cap_desc",
-    per_page = 20,
-  } = params;
-
-  const queryParams = {
+// ── Fetch crypto data from CoinGecko ──
+async function fetchCryptoMarkets({ vs_currency = "usd", order = "market_cap_desc", per_page = 20 } = {}) {
+  const params = new URLSearchParams({
     vs_currency,
     order,
-    per_page,
-    page: 1,
-    sparkline: false,
+    per_page: String(per_page),
+    page: "1",
+    sparkline: "false",
     price_change_percentage: "24h,7d",
-  };
-
-  if (ids) queryParams.ids = ids;
-
-  const { data } = await axios.get(`${COINGECKO_BASE}/coins/markets`, {
-    params: queryParams,
   });
+
+  const res = await fetch(`${COINGECKO_BASE}/coins/markets?${params}`);
+  if (!res.ok) throw new Error(`CoinGecko API error: ${res.status}`);
+  const data = await res.json();
 
   return data.map((coin) => ({
     id: coin.id,
@@ -45,128 +32,160 @@ async function fetchCryptoMarkets(params = {}) {
     market_cap: coin.market_cap,
     total_volume: coin.total_volume,
     price_change_percentage_24h: coin.price_change_percentage_24h,
-    price_change_percentage_7d:
-      coin.price_change_percentage_7d_in_currency ?? null,
+    price_change_percentage_7d: coin.price_change_percentage_7d_in_currency ?? null,
     image: coin.image,
   }));
 }
 
-// ── MCP configuration ──
-const mcpConfig = {
-  name: "crypto-monitor",
-  version: "1.0.0",
-  description:
-    "Explore and compare crypto assets by price, volume, market cap, and timeframe",
-  tools: [
-    {
-      name: "get_crypto_prices",
-      description:
-        "Retrieve cryptocurrency market data including prices, market cap, volume, and price changes across timeframes",
-      parameters: {
-        type: "object",
-        properties: {
-          ids: {
-            type: "string",
-            description:
-              'Comma-separated CoinGecko coin IDs (e.g. "bitcoin,ethereum,solana"). Leave empty for top coins.',
-          },
-          vs_currency: {
-            type: "string",
-            description: 'Target currency (default: "usd")',
-            default: "usd",
-          },
-          order: {
-            type: "string",
-            description: "Sort order for the API query",
-            enum: [
-              "market_cap_desc",
-              "market_cap_asc",
-              "volume_desc",
-              "volume_asc",
-            ],
-            default: "market_cap_desc",
-          },
-          per_page: {
-            type: "number",
-            description: "Number of results (1-100, default 20)",
-            default: 20,
+// ── Create MCP server instance ──
+function createCryptoServer() {
+  const server = new McpServer({
+    name: "crypto-monitor",
+    version: "1.0.0",
+  });
+
+  // Register the widget as an MCP resource
+  server.registerResource(
+    "crypto-widget",
+    "ui://widget/crypto-monitor.html",
+    {},
+    async () => ({
+      contents: [
+        {
+          uri: "ui://widget/crypto-monitor.html",
+          mimeType: "text/html+skybridge",
+          text: widgetHtml,
+          _meta: {
+            "openai/widgetPrefersBorder": true,
           },
         },
+      ],
+    })
+  );
+
+  // Register the crypto prices tool
+  server.registerTool(
+    "get_crypto_prices",
+    {
+      title: "Get Crypto Prices",
+      description:
+        "Use this when the user wants to explore, compare, or monitor cryptocurrency prices, market caps, volumes, or price changes. Returns top coins from CoinGecko with 24h and 7d change data.",
+      inputSchema: {
+        vs_currency: z
+          .string()
+          .default("usd")
+          .describe("Target fiat currency (e.g. usd, eur)"),
+        order: z
+          .enum(["market_cap_desc", "market_cap_asc", "volume_desc", "volume_asc"])
+          .default("market_cap_desc")
+          .describe("Sort order for API query"),
+        per_page: z
+          .number()
+          .min(1)
+          .max(100)
+          .default(20)
+          .describe("Number of coins to return"),
+      },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: true,
+      },
+      _meta: {
+        "openai/outputTemplate": "ui://widget/crypto-monitor.html",
+        "openai/toolInvocation/invoking": "Fetching crypto data",
+        "openai/toolInvocation/invoked": "Crypto data loaded",
       },
     },
-  ],
-  widget: {
-    url: "/widget",
-    description: "Interactive cryptocurrency market dashboard",
-  },
-};
-
-// ── Parse JSON body from POST requests ──
-function parseBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    req.on("data", (chunk) => (body += chunk));
-    req.on("end", () => {
+    async (args) => {
       try {
-        resolve(body ? JSON.parse(body) : {});
-      } catch {
-        reject(new Error("Invalid JSON"));
+        const coins = await fetchCryptoMarkets({
+          vs_currency: args.vs_currency,
+          order: args.order,
+          per_page: args.per_page,
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Loaded ${coins.length} cryptocurrencies sorted by ${args.order}.`,
+            },
+          ],
+          structuredContent: {
+            coins,
+            updated_at: new Date().toISOString(),
+          },
+        };
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Error fetching data: ${err.message}` }],
+          structuredContent: { coins: [], error: err.message },
+        };
       }
-    });
-  });
+    }
+  );
+
+  return server;
 }
 
-// ── HTTP Server ──
-const server = http.createServer(async (req, res) => {
-  setCors(res);
-
-  // Handle CORS preflight
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    return res.end();
+// ── HTTP server ──
+const httpServer = createServer(async (req, res) => {
+  if (!req.url) {
+    res.writeHead(400).end("Missing URL");
+    return;
   }
 
-  const url = new URL(req.url, `http://localhost:${PORT}`);
+  const url = new URL(req.url, `http://${req.headers.host ?? "localhost"}`);
 
-  try {
-    // GET /mcp → MCP configuration
-    if (req.method === "GET" && url.pathname === "/mcp") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify(mcpConfig));
-    }
-
-    // POST /mcp/tools/get_crypto_prices → Fetch crypto data
-    if (
-      req.method === "POST" &&
-      url.pathname === "/mcp/tools/get_crypto_prices"
-    ) {
-      const params = await parseBody(req);
-      const data = await fetchCryptoMarkets(params);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ result: data }));
-    }
-
-    // GET /widget → Serve the HTML widget
-    if (req.method === "GET" && url.pathname === "/widget") {
-      const widgetPath = path.join(__dirname, "public", "widget.html");
-      const html = fs.readFileSync(widgetPath, "utf-8");
-      res.writeHead(200, { "Content-Type": "text/html" });
-      return res.end(html);
-    }
-
-    // 404 fallback
-    res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Not found" }));
-  } catch (err) {
-    console.error("Server error:", err.message);
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: err.message }));
+  // CORS preflight
+  if (req.method === "OPTIONS" && url.pathname === MCP_PATH) {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "POST, GET, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers": "content-type, mcp-session-id",
+      "Access-Control-Expose-Headers": "Mcp-Session-Id",
+    });
+    res.end();
+    return;
   }
+
+  // Health check
+  if (req.method === "GET" && url.pathname === "/") {
+    res.writeHead(200, { "content-type": "text/plain" }).end("Crypto Monitor MCP Server");
+    return;
+  }
+
+  // MCP endpoint
+  const MCP_METHODS = new Set(["POST", "GET", "DELETE"]);
+  if (url.pathname === MCP_PATH && req.method && MCP_METHODS.has(req.method)) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+
+    const server = createCryptoServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true,
+    });
+
+    res.on("close", () => {
+      transport.close();
+      server.close();
+    });
+
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(req, res);
+    } catch (error) {
+      console.error("MCP error:", error);
+      if (!res.headersSent) res.writeHead(500).end("Internal server error");
+    }
+    return;
+  }
+
+  res.writeHead(404).end("Not Found");
 });
 
-server.listen(PORT, () => {
-  console.log(`🚀 Crypto Monitor MCP Server running on http://localhost:${PORT}`);
-  console.log(`   MCP config:  http://localhost:${PORT}/mcp`);
-  console.log(`   Widget:      http://localhost:${PORT}/widget`);
-  console.log(`   Tool:        POST http://localhost:${PORT}/mcp/tools/get_crypto_prices`);
+httpServer.listen(port, () => {
+  console.log(`Crypto Monitor MCP server listening on http://localhost:${port}${MCP_PATH}`);
 });
