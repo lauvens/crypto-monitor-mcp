@@ -1,0 +1,13 @@
+{
+  "name": "crypto-monitor-mcp",
+  "version": "1.0.0",
+  "description": "Cryptocurrency market monitor MCP server for Athena AI",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.0"
+  }
+}
